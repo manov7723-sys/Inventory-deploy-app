@@ -3,9 +3,15 @@
 FROM node:20-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
-# COPY all files except those excluded (including .git) to keep lefthook happy
-COPY . .
+# COPY all files except those excluded (including .git) but .git is excluded by default so copy only needed files
+COPY package.json package-lock.json* .
+COPY prisma ./prisma/
+COPY lefthook.* .
 RUN npm install --legacy-peer-deps
+# COPY remaining source files to avoid losing .git, lefthook expects a git repo but .git is excluded so we disable lefthook auto install
+COPY . .
+# Disable lefthook automatic install (left by npm install) to avoid "not a git repo" error
+RUN npm set-script postinstall ""
 # Prisma: generate the client BEFORE build (no-op without a schema).
 RUN if [ -f prisma/schema.prisma ] || [ -f schema.prisma ]; then \
       npx --yes prisma generate; \
