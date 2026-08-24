@@ -30,4 +30,4 @@ COPY --from=builder /app .
 USER node
 EXPOSE 3000
 # Fixed CMD to launch common Next.js production server entrypoint
-CMD ["node", "server.js"]
+CMD ["node", ".next/standalone/server.js"]
