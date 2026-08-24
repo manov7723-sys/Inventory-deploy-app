@@ -13,6 +13,7 @@ permissions:
   contents: read
 
   #add this line 
+  #real one
 
 jobs:
   deploy:
