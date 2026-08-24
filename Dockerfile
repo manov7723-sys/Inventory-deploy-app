@@ -29,5 +29,6 @@ WORKDIR /app
 COPY --from=builder /app .
 USER node
 EXPOSE 3000
-# Fixed CMD to launch common Next.js production server entrypoint
-CMD ["node", ".next/standalone/server.js"]
+# Corrected CMD to launch Next.js built app: use `node server.js` or `node .next/standalone/server.js` if standalone
+# Here it appears to be using `server.js` at the app root, so keep that.
+CMD ["node", "server.js"]
