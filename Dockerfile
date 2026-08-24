@@ -26,8 +26,8 @@ ENV NODE_ENV=production
 WORKDIR /app
 # Copy the built app WITH its node_modules from the builder (avoids a second
 # install and guarantees framework binaries + build output are present).
-COPY --from=builder /app ./
+COPY --from=builder /app .
 USER node
 EXPOSE 3000
 # Fixed CMD to launch common Next.js production server entrypoint
-CMD ["sh", "-c", "export PATH=/app/node_modules/.bin:$PATH; exec node index.js || exec next start"]
+CMD ["sh", "-c", "export PATH=/app/node_modules/.bin:$PATH; exec next start"]
