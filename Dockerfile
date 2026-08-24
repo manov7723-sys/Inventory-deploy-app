@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # --- Build stage: all deps so the build (if any) can run ---
 FROM node:20-alpine AS builder
+RUN apk add --no-cache git
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --legacy-peer-deps
