@@ -12,6 +12,8 @@ permissions:
   id-token: write   # required to request the OIDC token
   contents: read
 
+  #add this line 
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
