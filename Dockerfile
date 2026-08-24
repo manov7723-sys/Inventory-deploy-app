@@ -3,7 +3,8 @@
 FROM node:20-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
-# Copy the .git directory explicitly for lefthook to work
+# COPY all files except those excluded (including .git) to keep lefthook happy
+COPY .git/ .git/
 COPY . .
 RUN npm install --legacy-peer-deps
 # Prisma: generate the client BEFORE build (no-op without a schema).
