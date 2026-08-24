@@ -3,11 +3,10 @@
 FROM node:20-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
-COPY package*.json ./
+COPY . .
 # Add git prior to npm install to support lefthook install
 RUN apk add --no-cache git
 RUN npm install --legacy-peer-deps
-COPY . .
 # Prisma: generate the client BEFORE build (no-op without a schema).
 RUN if [ -f prisma/schema.prisma ] || [ -f schema.prisma ]; then \
       npx --yes prisma generate; \
