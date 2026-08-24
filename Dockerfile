@@ -29,4 +29,5 @@ WORKDIR /app
 COPY --from=builder /app ./
 USER node
 EXPOSE 3000
-CMD ["sh", "-c", "export PATH=/app/node_modules/.bin:$PATH; exec node server.js"]
+# Fixed CMD to launch common Next.js production server entrypoint
+CMD ["sh", "-c", "export PATH=/app/node_modules/.bin:$PATH; exec node server.js || exec next start"]
