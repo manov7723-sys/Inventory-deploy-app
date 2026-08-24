@@ -30,4 +30,4 @@ COPY --from=builder /app .
 USER node
 EXPOSE 3000
 # Fixed CMD to launch common Next.js production server entrypoint
-CMD ["sh", "-c", "export PATH=/app/node_modules/.bin:$PATH; exec next start"]
+CMD ["node", "server.js"]
