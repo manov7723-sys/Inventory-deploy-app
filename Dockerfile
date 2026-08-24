@@ -5,7 +5,7 @@ RUN apk add --no-cache git
 WORKDIR /app
 # COPY all files except those excluded (including .git) to keep lefthook happy
 COPY . .
-RUN npm set-script postinstall ""
+RUN npm pkg delete scripts.prepare >/dev/null 2>&1 || true
 RUN npm install --legacy-peer-deps
 # Prisma: generate the client BEFORE build (no-op without a schema).
 RUN if [ -f prisma/schema.prisma ] || [ -f schema.prisma ]; then \
