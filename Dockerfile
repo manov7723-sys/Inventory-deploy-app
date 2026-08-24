@@ -3,7 +3,7 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN npm install --legacy-peer-deps
 COPY . .
 # Prisma: generate the client BEFORE build (no-op without a schema).
 RUN if [ -f prisma/schema.prisma ] || [ -f schema.prisma ]; then \
