@@ -42,8 +42,7 @@ spec:
             periodSeconds: 5
             failureThreshold: 30
           readinessProbe:
-            httpGet:
-              path: /health
+            tcpSocket:
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 10
