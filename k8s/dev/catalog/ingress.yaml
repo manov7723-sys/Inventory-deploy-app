@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: inventory-deploy-app-catalog
+  namespace: storefront-dev--1
+  annotations:
+    "kubernetes.io/ingress.class": "alb"
+    "alb.ingress.kubernetes.io/scheme": "internet-facing"
+    "alb.ingress.kubernetes.io/target-type": "ip"
+    "alb.ingress.kubernetes.io/listen-ports": "[{\"HTTP\": 80}]"
+    "alb.ingress.kubernetes.io/healthcheck-path": "/health"
+    "alb.ingress.kubernetes.io/group.name": "inventory-deploy-app-dev-catalog"
+    "alb.ingress.kubernetes.io/group.order": "900"
+  labels:
+    app.kubernetes.io/name: inventory-deploy-app-catalog
+    app.kubernetes.io/managed-by: deepagent
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-deploy-app-catalog
+                port:
+                  number: 80

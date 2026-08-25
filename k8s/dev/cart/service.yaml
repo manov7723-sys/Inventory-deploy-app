@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-deploy-app-cart
+  namespace: storefront-dev--1
+  labels:
+    app.kubernetes.io/name: inventory-deploy-app-cart
+    app.kubernetes.io/managed-by: deepagent
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: inventory-deploy-app-cart
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
