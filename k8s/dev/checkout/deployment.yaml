@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: inventory-deploy-app-checkout
-  namespace: storefront-dev--1
+  namespace: storefront-dev-1
   labels:
     app.kubernetes.io/name: inventory-deploy-app-checkout
     app.kubernetes.io/managed-by: deepagent
@@ -28,7 +28,7 @@ spec:
           image: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-checkout:latest
           imagePullPolicy: Always
           ports:
-            - containerPort: 3000
+            - containerPort: 8080
           resources:
             requests:
               cpu: 100m
@@ -38,18 +38,19 @@ spec:
               memory: 512Mi
           startupProbe:
             tcpSocket:
-              port: 3000
+              port: 8080
             periodSeconds: 5
             failureThreshold: 30
           readinessProbe:
-            tcpSocket:
-              port: 3000
+            httpGet:
+              path: /
+              port: 8080
             initialDelaySeconds: 3
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             tcpSocket:
-              port: 3000
+              port: 8080
             initialDelaySeconds: 10
             periodSeconds: 20
             failureThreshold: 5
@@ -64,11 +65,13 @@ spec:
                 name: app-env-checkout
                 optional: true
           env:
+            - name: SESSION_COOKIE_SECURE
+              value: "false"
             - name: CART_URL
-              value: http://cart.storefront-dev--1.svc.cluster.local
+              value: http://cart.storefront-dev-1.svc.cluster.local
             - name: CATALOG_URL
-              value: http://catalog.storefront-dev--1.svc.cluster.local
+              value: http://catalog.storefront-dev-1.svc.cluster.local
             - name: ORDERS_URL
-              value: http://orders.storefront-dev--1.svc.cluster.local
+              value: http://orders.storefront-dev-1.svc.cluster.local
             - name: UI_URL
-              value: http://ui.storefront-dev--1.svc.cluster.local
+              value: http://ui.storefront-dev-1.svc.cluster.local
