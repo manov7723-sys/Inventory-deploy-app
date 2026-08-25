@@ -1,0 +1,159 @@
+name: CI (build all services)
+
+# Manual trigger — click "Run" in the Actions tab (or the app's CI/CD Pipelines page).
+# When this workflow succeeds, the CD workflow fires automatically via workflow_run.
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required to request the OIDC token
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build and push all services
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no stored secrets)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::400200465532:role/gha-manov7723-sys-inventory-deploy-app-inventory-deploy-app-cart
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and tag cart image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-cart
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR:$TAG" -t "$ECR:latest" -f "src/cart/Dockerfile" "src/cart"
+
+      - name: Scan cart image for vulnerabilities (Trivy)
+        continue-on-error: true
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-cart
+          TAG: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.65.0 image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            "$ECR:$TAG" || echo "::warning::Trivy flagged issues or could not run — non-blocking, see logs."
+      - name: Push cart image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-cart
+          TAG: ${{ github.sha }}
+        run: |
+          docker push "$ECR:$TAG"
+          docker push "$ECR:latest"
+
+      - name: Build and tag catalog image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-catalog
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR:$TAG" -t "$ECR:latest" -f "src/catalog/Dockerfile" "src/catalog"
+
+      - name: Scan catalog image for vulnerabilities (Trivy)
+        continue-on-error: true
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-catalog
+          TAG: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.65.0 image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            "$ECR:$TAG" || echo "::warning::Trivy flagged issues or could not run — non-blocking, see logs."
+      - name: Push catalog image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-catalog
+          TAG: ${{ github.sha }}
+        run: |
+          docker push "$ECR:$TAG"
+          docker push "$ECR:latest"
+
+      - name: Build and tag checkout image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-checkout
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR:$TAG" -t "$ECR:latest" -f "src/checkout/Dockerfile" "src/checkout"
+
+      - name: Scan checkout image for vulnerabilities (Trivy)
+        continue-on-error: true
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-checkout
+          TAG: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.65.0 image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            "$ECR:$TAG" || echo "::warning::Trivy flagged issues or could not run — non-blocking, see logs."
+      - name: Push checkout image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-checkout
+          TAG: ${{ github.sha }}
+        run: |
+          docker push "$ECR:$TAG"
+          docker push "$ECR:latest"
+
+      - name: Build and tag orders image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-orders
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR:$TAG" -t "$ECR:latest" -f "src/orders/Dockerfile" "src/orders"
+
+      - name: Scan orders image for vulnerabilities (Trivy)
+        continue-on-error: true
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-orders
+          TAG: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.65.0 image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            "$ECR:$TAG" || echo "::warning::Trivy flagged issues or could not run — non-blocking, see logs."
+      - name: Push orders image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-orders
+          TAG: ${{ github.sha }}
+        run: |
+          docker push "$ECR:$TAG"
+          docker push "$ECR:latest"
+
+      - name: Build and tag ui image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-ui
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR:$TAG" -t "$ECR:latest" -f "src/ui/Dockerfile" "src/ui"
+
+      - name: Scan ui image for vulnerabilities (Trivy)
+        continue-on-error: true
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-ui
+          TAG: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.65.0 image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            "$ECR:$TAG" || echo "::warning::Trivy flagged issues or could not run — non-blocking, see logs."
+      - name: Push ui image
+        env:
+          ECR: 400200465532.dkr.ecr.us-east-1.amazonaws.com/inventory-deploy-app-ui
+          TAG: ${{ github.sha }}
+        run: |
+          docker push "$ECR:$TAG"
+          docker push "$ECR:latest"
