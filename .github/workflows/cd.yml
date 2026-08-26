@@ -31,16 +31,16 @@ jobs:
         uses: azure/setup-kubectl@v4
 
       - name: Configure cluster access (keyless)
-        run: aws eks update-kubeconfig --name "store-new-deployment-dev" --region us-east-1
+        run: aws eks update-kubeconfig --name "nex-dev-project-dev" --region us-east-1
 
-      - name: Ensure namespace storefront-dev-237 is Active (auto-heal if stuck Terminating)
+      - name: Ensure namespace storefront-dev is Active (auto-heal if stuck Terminating)
         # Three-stage self-heal — see cicd-pipeline.ts for the full rationale.
         # Stage 1: wait 60s for natural termination.
         # Stage 2: force-clear finalizers on Services + PVCs, wait 30s.
         # Stage 3: nuke the namespace's own finalizer via /finalize subresource.
         run: |
           set -eu
-          NS="storefront-dev-237"
+          NS="storefront-dev"
           ns_phase() { kubectl get namespace "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo ""; }
           for i in $(seq 1 30); do
             p=$(ns_phase)
@@ -92,18 +92,18 @@ jobs:
         # repos whose manifests are still split across multiple files.
         run: |
           if [ -f "k8s/dev/cart/manifest.yaml" ]; then
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/cart/manifest.yaml"
+            kubectl apply -n storefront-dev -f "k8s/dev/cart/manifest.yaml"
           else
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/cart/"
+            kubectl apply -n storefront-dev -f "k8s/dev/cart/"
           fi
 
       - name: Restart cart rollout (image tag "latest" — force pods onto the new build)
         id: restart_cart
-        run: kubectl rollout restart deployment/inventory-deploy-app-cart -n storefront-dev-237
+        run: kubectl rollout restart deployment/inventory-deploy-app-cart -n storefront-dev
 
       - name: Wait for cart rollout
         id: wait_cart
-        run: kubectl rollout status deployment/inventory-deploy-app-cart -n storefront-dev-237 --timeout=360s
+        run: kubectl rollout status deployment/inventory-deploy-app-cart -n storefront-dev --timeout=360s
 
       - name: Diagnose cart on failed rollout
         # Runs BEFORE rollback so the job log preserves what actually went wrong
@@ -114,16 +114,16 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::pods"
-          kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-cart -o wide || true
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart -o wide || true
           echo "::endgroup::"
           echo "::group::describe"
-          kubectl describe pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-cart | tail -n 60 || true
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart | tail -n 60 || true
           echo "::endgroup::"
           echo "::group::logs"
-          kubectl logs -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-cart --tail=100 --all-containers=true --prefix=true || true
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart --tail=100 --all-containers=true --prefix=true || true
           echo "::endgroup::"
           echo "::group::events"
-          kubectl get events -n storefront-dev-237 --sort-by=.lastTimestamp | tail -n 30 || true
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
           echo "::endgroup::"
           echo "::group::deployment facts (from facts.json, committed at discovery time)"
           FACTS_FILE=$(ls -1 k8s/*/cart/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
@@ -135,10 +135,10 @@ jobs:
           fi
           echo "::endgroup::"
           echo "::group::port-mismatch check"
-          POD=$(kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-cart -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$POD" ]; then
-            PROBE_PORT=$(kubectl get pod -n storefront-dev-237 "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
-            LISTENING=$(kubectl exec -n storefront-dev-237 "$POD" -- sh -c '
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
               for f in /proc/net/tcp /proc/net/tcp6; do
                 [ -r "$f" ] || continue
                 awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
@@ -165,14 +165,14 @@ jobs:
         # the pipeline recognised a first-deploy vs. an actual failure.
         if: ${{ always() && (steps.apply_cart.outcome == 'failure' || steps.restart_cart.outcome == 'failure' || steps.wait_cart.outcome == 'failure') }}
         run: |
-          REVS=$(kubectl rollout history deployment/inventory-deploy-app-cart -n storefront-dev-237 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-cart -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
           if [ "$REVS" -lt 2 ]; then
             echo "::warning::Rollout of inventory-deploy-app-cart failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
             exit 1
           fi
           echo "::warning::Rollout of inventory-deploy-app-cart failed its health check — rolling back to the previous revision."
-          kubectl rollout undo deployment/inventory-deploy-app-cart -n storefront-dev-237
-          kubectl rollout status deployment/inventory-deploy-app-cart -n storefront-dev-237 --timeout=240s
+          kubectl rollout undo deployment/inventory-deploy-app-cart -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-cart -n storefront-dev --timeout=240s
 
       - name: Apply catalog manifests
         id: apply_catalog
@@ -184,18 +184,18 @@ jobs:
         # repos whose manifests are still split across multiple files.
         run: |
           if [ -f "k8s/dev/catalog/manifest.yaml" ]; then
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/catalog/manifest.yaml"
+            kubectl apply -n storefront-dev -f "k8s/dev/catalog/manifest.yaml"
           else
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/catalog/"
+            kubectl apply -n storefront-dev -f "k8s/dev/catalog/"
           fi
 
       - name: Restart catalog rollout (image tag "latest" — force pods onto the new build)
         id: restart_catalog
-        run: kubectl rollout restart deployment/inventory-deploy-app-catalog -n storefront-dev-237
+        run: kubectl rollout restart deployment/inventory-deploy-app-catalog -n storefront-dev
 
       - name: Wait for catalog rollout
         id: wait_catalog
-        run: kubectl rollout status deployment/inventory-deploy-app-catalog -n storefront-dev-237 --timeout=360s
+        run: kubectl rollout status deployment/inventory-deploy-app-catalog -n storefront-dev --timeout=360s
 
       - name: Diagnose catalog on failed rollout
         # Runs BEFORE rollback so the job log preserves what actually went wrong
@@ -206,16 +206,16 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::pods"
-          kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-catalog -o wide || true
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog -o wide || true
           echo "::endgroup::"
           echo "::group::describe"
-          kubectl describe pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-catalog | tail -n 60 || true
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog | tail -n 60 || true
           echo "::endgroup::"
           echo "::group::logs"
-          kubectl logs -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-catalog --tail=100 --all-containers=true --prefix=true || true
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog --tail=100 --all-containers=true --prefix=true || true
           echo "::endgroup::"
           echo "::group::events"
-          kubectl get events -n storefront-dev-237 --sort-by=.lastTimestamp | tail -n 30 || true
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
           echo "::endgroup::"
           echo "::group::deployment facts (from facts.json, committed at discovery time)"
           FACTS_FILE=$(ls -1 k8s/*/catalog/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
@@ -227,10 +227,10 @@ jobs:
           fi
           echo "::endgroup::"
           echo "::group::port-mismatch check"
-          POD=$(kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$POD" ]; then
-            PROBE_PORT=$(kubectl get pod -n storefront-dev-237 "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
-            LISTENING=$(kubectl exec -n storefront-dev-237 "$POD" -- sh -c '
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
               for f in /proc/net/tcp /proc/net/tcp6; do
                 [ -r "$f" ] || continue
                 awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
@@ -257,14 +257,14 @@ jobs:
         # the pipeline recognised a first-deploy vs. an actual failure.
         if: ${{ always() && (steps.apply_catalog.outcome == 'failure' || steps.restart_catalog.outcome == 'failure' || steps.wait_catalog.outcome == 'failure') }}
         run: |
-          REVS=$(kubectl rollout history deployment/inventory-deploy-app-catalog -n storefront-dev-237 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-catalog -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
           if [ "$REVS" -lt 2 ]; then
             echo "::warning::Rollout of inventory-deploy-app-catalog failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
             exit 1
           fi
           echo "::warning::Rollout of inventory-deploy-app-catalog failed its health check — rolling back to the previous revision."
-          kubectl rollout undo deployment/inventory-deploy-app-catalog -n storefront-dev-237
-          kubectl rollout status deployment/inventory-deploy-app-catalog -n storefront-dev-237 --timeout=240s
+          kubectl rollout undo deployment/inventory-deploy-app-catalog -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-catalog -n storefront-dev --timeout=240s
 
       - name: Apply checkout manifests
         id: apply_checkout
@@ -276,18 +276,18 @@ jobs:
         # repos whose manifests are still split across multiple files.
         run: |
           if [ -f "k8s/dev/checkout/manifest.yaml" ]; then
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/checkout/manifest.yaml"
+            kubectl apply -n storefront-dev -f "k8s/dev/checkout/manifest.yaml"
           else
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/checkout/"
+            kubectl apply -n storefront-dev -f "k8s/dev/checkout/"
           fi
 
       - name: Restart checkout rollout (image tag "latest" — force pods onto the new build)
         id: restart_checkout
-        run: kubectl rollout restart deployment/inventory-deploy-app-checkout -n storefront-dev-237
+        run: kubectl rollout restart deployment/inventory-deploy-app-checkout -n storefront-dev
 
       - name: Wait for checkout rollout
         id: wait_checkout
-        run: kubectl rollout status deployment/inventory-deploy-app-checkout -n storefront-dev-237 --timeout=360s
+        run: kubectl rollout status deployment/inventory-deploy-app-checkout -n storefront-dev --timeout=360s
 
       - name: Diagnose checkout on failed rollout
         # Runs BEFORE rollback so the job log preserves what actually went wrong
@@ -298,16 +298,16 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::pods"
-          kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-checkout -o wide || true
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout -o wide || true
           echo "::endgroup::"
           echo "::group::describe"
-          kubectl describe pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-checkout | tail -n 60 || true
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout | tail -n 60 || true
           echo "::endgroup::"
           echo "::group::logs"
-          kubectl logs -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-checkout --tail=100 --all-containers=true --prefix=true || true
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout --tail=100 --all-containers=true --prefix=true || true
           echo "::endgroup::"
           echo "::group::events"
-          kubectl get events -n storefront-dev-237 --sort-by=.lastTimestamp | tail -n 30 || true
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
           echo "::endgroup::"
           echo "::group::deployment facts (from facts.json, committed at discovery time)"
           FACTS_FILE=$(ls -1 k8s/*/checkout/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
@@ -319,10 +319,10 @@ jobs:
           fi
           echo "::endgroup::"
           echo "::group::port-mismatch check"
-          POD=$(kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-checkout -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$POD" ]; then
-            PROBE_PORT=$(kubectl get pod -n storefront-dev-237 "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
-            LISTENING=$(kubectl exec -n storefront-dev-237 "$POD" -- sh -c '
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
               for f in /proc/net/tcp /proc/net/tcp6; do
                 [ -r "$f" ] || continue
                 awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
@@ -349,14 +349,14 @@ jobs:
         # the pipeline recognised a first-deploy vs. an actual failure.
         if: ${{ always() && (steps.apply_checkout.outcome == 'failure' || steps.restart_checkout.outcome == 'failure' || steps.wait_checkout.outcome == 'failure') }}
         run: |
-          REVS=$(kubectl rollout history deployment/inventory-deploy-app-checkout -n storefront-dev-237 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-checkout -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
           if [ "$REVS" -lt 2 ]; then
             echo "::warning::Rollout of inventory-deploy-app-checkout failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
             exit 1
           fi
           echo "::warning::Rollout of inventory-deploy-app-checkout failed its health check — rolling back to the previous revision."
-          kubectl rollout undo deployment/inventory-deploy-app-checkout -n storefront-dev-237
-          kubectl rollout status deployment/inventory-deploy-app-checkout -n storefront-dev-237 --timeout=240s
+          kubectl rollout undo deployment/inventory-deploy-app-checkout -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-checkout -n storefront-dev --timeout=240s
 
       - name: Apply orders manifests
         id: apply_orders
@@ -368,18 +368,18 @@ jobs:
         # repos whose manifests are still split across multiple files.
         run: |
           if [ -f "k8s/dev/orders/manifest.yaml" ]; then
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/orders/manifest.yaml"
+            kubectl apply -n storefront-dev -f "k8s/dev/orders/manifest.yaml"
           else
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/orders/"
+            kubectl apply -n storefront-dev -f "k8s/dev/orders/"
           fi
 
       - name: Restart orders rollout (image tag "latest" — force pods onto the new build)
         id: restart_orders
-        run: kubectl rollout restart deployment/inventory-deploy-app-orders -n storefront-dev-237
+        run: kubectl rollout restart deployment/inventory-deploy-app-orders -n storefront-dev
 
       - name: Wait for orders rollout
         id: wait_orders
-        run: kubectl rollout status deployment/inventory-deploy-app-orders -n storefront-dev-237 --timeout=360s
+        run: kubectl rollout status deployment/inventory-deploy-app-orders -n storefront-dev --timeout=360s
 
       - name: Diagnose orders on failed rollout
         # Runs BEFORE rollback so the job log preserves what actually went wrong
@@ -390,16 +390,16 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::pods"
-          kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-orders -o wide || true
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders -o wide || true
           echo "::endgroup::"
           echo "::group::describe"
-          kubectl describe pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-orders | tail -n 60 || true
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders | tail -n 60 || true
           echo "::endgroup::"
           echo "::group::logs"
-          kubectl logs -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-orders --tail=100 --all-containers=true --prefix=true || true
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders --tail=100 --all-containers=true --prefix=true || true
           echo "::endgroup::"
           echo "::group::events"
-          kubectl get events -n storefront-dev-237 --sort-by=.lastTimestamp | tail -n 30 || true
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
           echo "::endgroup::"
           echo "::group::deployment facts (from facts.json, committed at discovery time)"
           FACTS_FILE=$(ls -1 k8s/*/orders/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
@@ -411,10 +411,10 @@ jobs:
           fi
           echo "::endgroup::"
           echo "::group::port-mismatch check"
-          POD=$(kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-orders -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$POD" ]; then
-            PROBE_PORT=$(kubectl get pod -n storefront-dev-237 "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
-            LISTENING=$(kubectl exec -n storefront-dev-237 "$POD" -- sh -c '
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
               for f in /proc/net/tcp /proc/net/tcp6; do
                 [ -r "$f" ] || continue
                 awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
@@ -441,14 +441,14 @@ jobs:
         # the pipeline recognised a first-deploy vs. an actual failure.
         if: ${{ always() && (steps.apply_orders.outcome == 'failure' || steps.restart_orders.outcome == 'failure' || steps.wait_orders.outcome == 'failure') }}
         run: |
-          REVS=$(kubectl rollout history deployment/inventory-deploy-app-orders -n storefront-dev-237 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-orders -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
           if [ "$REVS" -lt 2 ]; then
             echo "::warning::Rollout of inventory-deploy-app-orders failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
             exit 1
           fi
           echo "::warning::Rollout of inventory-deploy-app-orders failed its health check — rolling back to the previous revision."
-          kubectl rollout undo deployment/inventory-deploy-app-orders -n storefront-dev-237
-          kubectl rollout status deployment/inventory-deploy-app-orders -n storefront-dev-237 --timeout=240s
+          kubectl rollout undo deployment/inventory-deploy-app-orders -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-orders -n storefront-dev --timeout=240s
 
       - name: Apply ui manifests
         id: apply_ui
@@ -460,18 +460,18 @@ jobs:
         # repos whose manifests are still split across multiple files.
         run: |
           if [ -f "k8s/dev/ui/manifest.yaml" ]; then
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/ui/manifest.yaml"
+            kubectl apply -n storefront-dev -f "k8s/dev/ui/manifest.yaml"
           else
-            kubectl apply -n storefront-dev-237 -f "k8s/dev/ui/"
+            kubectl apply -n storefront-dev -f "k8s/dev/ui/"
           fi
 
       - name: Restart ui rollout (image tag "latest" — force pods onto the new build)
         id: restart_ui
-        run: kubectl rollout restart deployment/inventory-deploy-app-ui -n storefront-dev-237
+        run: kubectl rollout restart deployment/inventory-deploy-app-ui -n storefront-dev
 
       - name: Wait for ui rollout
         id: wait_ui
-        run: kubectl rollout status deployment/inventory-deploy-app-ui -n storefront-dev-237 --timeout=360s
+        run: kubectl rollout status deployment/inventory-deploy-app-ui -n storefront-dev --timeout=360s
 
       - name: Diagnose ui on failed rollout
         # Runs BEFORE rollback so the job log preserves what actually went wrong
@@ -482,16 +482,16 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::pods"
-          kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-ui -o wide || true
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui -o wide || true
           echo "::endgroup::"
           echo "::group::describe"
-          kubectl describe pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-ui | tail -n 60 || true
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui | tail -n 60 || true
           echo "::endgroup::"
           echo "::group::logs"
-          kubectl logs -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-ui --tail=100 --all-containers=true --prefix=true || true
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui --tail=100 --all-containers=true --prefix=true || true
           echo "::endgroup::"
           echo "::group::events"
-          kubectl get events -n storefront-dev-237 --sort-by=.lastTimestamp | tail -n 30 || true
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
           echo "::endgroup::"
           echo "::group::deployment facts (from facts.json, committed at discovery time)"
           FACTS_FILE=$(ls -1 k8s/*/ui/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
@@ -503,10 +503,10 @@ jobs:
           fi
           echo "::endgroup::"
           echo "::group::port-mismatch check"
-          POD=$(kubectl get pods -n storefront-dev-237 -l app.kubernetes.io/name=inventory-deploy-app-ui -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$POD" ]; then
-            PROBE_PORT=$(kubectl get pod -n storefront-dev-237 "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
-            LISTENING=$(kubectl exec -n storefront-dev-237 "$POD" -- sh -c '
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
               for f in /proc/net/tcp /proc/net/tcp6; do
                 [ -r "$f" ] || continue
                 awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
@@ -533,11 +533,11 @@ jobs:
         # the pipeline recognised a first-deploy vs. an actual failure.
         if: ${{ always() && (steps.apply_ui.outcome == 'failure' || steps.restart_ui.outcome == 'failure' || steps.wait_ui.outcome == 'failure') }}
         run: |
-          REVS=$(kubectl rollout history deployment/inventory-deploy-app-ui -n storefront-dev-237 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-ui -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
           if [ "$REVS" -lt 2 ]; then
             echo "::warning::Rollout of inventory-deploy-app-ui failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
             exit 1
           fi
           echo "::warning::Rollout of inventory-deploy-app-ui failed its health check — rolling back to the previous revision."
-          kubectl rollout undo deployment/inventory-deploy-app-ui -n storefront-dev-237
-          kubectl rollout status deployment/inventory-deploy-app-ui -n storefront-dev-237 --timeout=240s
+          kubectl rollout undo deployment/inventory-deploy-app-ui -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-ui -n storefront-dev --timeout=240s
