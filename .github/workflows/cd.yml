@@ -1,0 +1,543 @@
+name: CD (deploy all services)
+
+# Runs automatically after the CI workflow ("CI (build all services)") completes successfully.
+# Also supports manual dispatch for redeploying without a fresh build.
+on:
+  workflow_run:
+    workflows: ["CI (build all services)"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required to request the OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy all services
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no stored secrets)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::400200465532:role/gha-manov7723-sys-inventory-deploy-app-inventory-deploy-app-cart
+          aws-region: us-east-1
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure cluster access (keyless)
+        run: aws eks update-kubeconfig --name "new-one-dev" --region us-east-1
+
+      - name: Ensure namespace storefront-dev is Active (auto-heal if stuck Terminating)
+        # Three-stage self-heal — see cicd-pipeline.ts for the full rationale.
+        # Stage 1: wait 60s for natural termination.
+        # Stage 2: force-clear finalizers on Services + PVCs, wait 30s.
+        # Stage 3: nuke the namespace's own finalizer via /finalize subresource.
+        run: |
+          set -eu
+          NS="storefront-dev"
+          ns_phase() { kubectl get namespace "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo ""; }
+          for i in $(seq 1 30); do
+            p=$(ns_phase)
+            { [ -z "$p" ] || [ "$p" = "Active" ]; } && break
+            echo "namespace $NS is $p — waiting for natural termination ($i/30)"
+            sleep 2
+          done
+          p=$(ns_phase)
+          if [ "$p" = "Terminating" ]; then
+            echo "::warning::Namespace $NS still Terminating after 60s — auto-clearing finalizers on Services and PVCs."
+            for kind in svc pvc; do
+              for res in $(kubectl get "$kind" -n "$NS" -o name 2>/dev/null); do
+                echo "  clearing finalizers on $res"
+                kubectl patch "$res" -n "$NS" -p '{"metadata":{"finalizers":null}}' --type=merge >/dev/null 2>&1 || true
+              done
+            done
+            for i in $(seq 1 15); do
+              p=$(ns_phase)
+              { [ -z "$p" ] || [ "$p" = "Active" ]; } && break
+              sleep 2
+            done
+          fi
+          p=$(ns_phase)
+          if [ "$p" = "Terminating" ]; then
+            echo "::warning::Namespace $NS still Terminating — force-clearing its own finalizer via /finalize subresource."
+            if command -v jq >/dev/null 2>&1; then
+              kubectl get namespace "$NS" -o json | jq '.spec.finalizers = []' | kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - >/dev/null 2>&1 || true
+            else
+              printf '%s' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"'"$NS"'"},"spec":{"finalizers":[]}}' | kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - >/dev/null 2>&1 || true
+            fi
+            sleep 3
+          fi
+          p=$(ns_phase)
+          [ -z "$p" ] && kubectl create namespace "$NS"
+          p=$(ns_phase)
+          if [ "$p" != "Active" ]; then
+            echo "::error::Namespace $NS auto-heal exhausted; still $p. Ask the agent to run unstick_terminating_namespace for deep diagnosis."
+            exit 1
+          fi
+          echo "namespace $NS is Active — proceeding with apply."
+
+      - name: Apply cart manifests
+        id: apply_cart
+        # Prefer manifest.yaml — deploy_my_app writes exactly that file, and
+        # applying the whole dir picks up any stale *.yaml (e.g. a
+        # hand-committed service.yaml from an older scaffold) that
+        # alphabetically-sorts AFTER it and silently overrides the freshly
+        # generated resource (2026-08 incident). Fall back to the dir for
+        # repos whose manifests are still split across multiple files.
+        run: |
+          if [ -f "k8s/dev/cart/manifest.yaml" ]; then
+            kubectl apply -n storefront-dev -f "k8s/dev/cart/manifest.yaml"
+          else
+            kubectl apply -n storefront-dev -f "k8s/dev/cart/"
+          fi
+
+      - name: Restart cart rollout (image tag "latest" — force pods onto the new build)
+        id: restart_cart
+        run: kubectl rollout restart deployment/inventory-deploy-app-cart -n storefront-dev
+
+      - name: Wait for cart rollout
+        id: wait_cart
+        run: kubectl rollout status deployment/inventory-deploy-app-cart -n storefront-dev --timeout=360s
+
+      - name: Diagnose cart on failed rollout
+        # Runs BEFORE rollback so the job log preserves what actually went wrong
+        # — the rollback undoes the state that would answer "why did it fail?".
+        # Prints pods + describe + logs + events, and detects the port-mismatch
+        # class (contract §5) by reading /proc/net/tcp{,6} inside the container.
+        if: ${{ always() && (steps.apply_cart.outcome == 'failure' || steps.restart_cart.outcome == 'failure' || steps.wait_cart.outcome == 'failure') }}
+        continue-on-error: true
+        run: |
+          echo "::group::pods"
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart -o wide || true
+          echo "::endgroup::"
+          echo "::group::describe"
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart | tail -n 60 || true
+          echo "::endgroup::"
+          echo "::group::logs"
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart --tail=100 --all-containers=true --prefix=true || true
+          echo "::endgroup::"
+          echo "::group::events"
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
+          echo "::endgroup::"
+          echo "::group::deployment facts (from facts.json, committed at discovery time)"
+          FACTS_FILE=$(ls -1 k8s/*/cart/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
+          if [ -n "$FACTS_FILE" ] && [ -f "$FACTS_FILE" ]; then
+            echo "reading $FACTS_FILE"
+            if command -v jq >/dev/null 2>&1; then jq . "$FACTS_FILE" || cat "$FACTS_FILE"; else cat "$FACTS_FILE"; fi
+          else
+            echo "no facts.json found (this pipeline predates the discovery layer, or discovery failed for this service)"
+          fi
+          echo "::endgroup::"
+          echo "::group::port-mismatch check"
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-cart -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
+              for f in /proc/net/tcp /proc/net/tcp6; do
+                [ -r "$f" ] || continue
+                awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
+              done | sort -u
+            ' 2>/dev/null | tr "\n" " " || true)
+            echo "probe expects port: $PROBE_PORT"
+            echo "app is listening on: ${LISTENING:-(nothing — process may have exited)}"
+            if [ -n "$PROBE_PORT" ] && [ -n "$LISTENING" ] && ! echo " $LISTENING " | grep -q " $PROBE_PORT "; then
+              echo "::error::PORT MISMATCH — probes dial :$PROBE_PORT but the app is only listening on: $LISTENING. Set PORT env in the manifest to match the app, or update containerPort/probe ports."
+            fi
+          else
+            echo "no pod found for label app.kubernetes.io/name=inventory-deploy-app-cart"
+          fi
+          echo "::endgroup::"
+
+      - name: Rollback cart on failed rollout
+        # Scoped to THIS service's own step outcomes (see sequentialDeploySteps
+        # comment). `always()` lets the step evaluate even when the job status
+        # is failure; the inner condition prevents rollback firing for a
+        # service whose steps were skipped because an earlier service failed.
+        # Contract §5: skip `rollout undo` on the first-ever deploy (history
+        # has only one revision — there's nothing to undo to; erroring on that
+        # confuses the log). We still print a clear message so the reader knows
+        # the pipeline recognised a first-deploy vs. an actual failure.
+        if: ${{ always() && (steps.apply_cart.outcome == 'failure' || steps.restart_cart.outcome == 'failure' || steps.wait_cart.outcome == 'failure') }}
+        run: |
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-cart -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          if [ "$REVS" -lt 2 ]; then
+            echo "::warning::Rollout of inventory-deploy-app-cart failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
+            exit 1
+          fi
+          echo "::warning::Rollout of inventory-deploy-app-cart failed its health check — rolling back to the previous revision."
+          kubectl rollout undo deployment/inventory-deploy-app-cart -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-cart -n storefront-dev --timeout=240s
+
+      - name: Apply catalog manifests
+        id: apply_catalog
+        # Prefer manifest.yaml — deploy_my_app writes exactly that file, and
+        # applying the whole dir picks up any stale *.yaml (e.g. a
+        # hand-committed service.yaml from an older scaffold) that
+        # alphabetically-sorts AFTER it and silently overrides the freshly
+        # generated resource (2026-08 incident). Fall back to the dir for
+        # repos whose manifests are still split across multiple files.
+        run: |
+          if [ -f "k8s/dev/catalog/manifest.yaml" ]; then
+            kubectl apply -n storefront-dev -f "k8s/dev/catalog/manifest.yaml"
+          else
+            kubectl apply -n storefront-dev -f "k8s/dev/catalog/"
+          fi
+
+      - name: Restart catalog rollout (image tag "latest" — force pods onto the new build)
+        id: restart_catalog
+        run: kubectl rollout restart deployment/inventory-deploy-app-catalog -n storefront-dev
+
+      - name: Wait for catalog rollout
+        id: wait_catalog
+        run: kubectl rollout status deployment/inventory-deploy-app-catalog -n storefront-dev --timeout=360s
+
+      - name: Diagnose catalog on failed rollout
+        # Runs BEFORE rollback so the job log preserves what actually went wrong
+        # — the rollback undoes the state that would answer "why did it fail?".
+        # Prints pods + describe + logs + events, and detects the port-mismatch
+        # class (contract §5) by reading /proc/net/tcp{,6} inside the container.
+        if: ${{ always() && (steps.apply_catalog.outcome == 'failure' || steps.restart_catalog.outcome == 'failure' || steps.wait_catalog.outcome == 'failure') }}
+        continue-on-error: true
+        run: |
+          echo "::group::pods"
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog -o wide || true
+          echo "::endgroup::"
+          echo "::group::describe"
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog | tail -n 60 || true
+          echo "::endgroup::"
+          echo "::group::logs"
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog --tail=100 --all-containers=true --prefix=true || true
+          echo "::endgroup::"
+          echo "::group::events"
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
+          echo "::endgroup::"
+          echo "::group::deployment facts (from facts.json, committed at discovery time)"
+          FACTS_FILE=$(ls -1 k8s/*/catalog/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
+          if [ -n "$FACTS_FILE" ] && [ -f "$FACTS_FILE" ]; then
+            echo "reading $FACTS_FILE"
+            if command -v jq >/dev/null 2>&1; then jq . "$FACTS_FILE" || cat "$FACTS_FILE"; else cat "$FACTS_FILE"; fi
+          else
+            echo "no facts.json found (this pipeline predates the discovery layer, or discovery failed for this service)"
+          fi
+          echo "::endgroup::"
+          echo "::group::port-mismatch check"
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
+              for f in /proc/net/tcp /proc/net/tcp6; do
+                [ -r "$f" ] || continue
+                awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
+              done | sort -u
+            ' 2>/dev/null | tr "\n" " " || true)
+            echo "probe expects port: $PROBE_PORT"
+            echo "app is listening on: ${LISTENING:-(nothing — process may have exited)}"
+            if [ -n "$PROBE_PORT" ] && [ -n "$LISTENING" ] && ! echo " $LISTENING " | grep -q " $PROBE_PORT "; then
+              echo "::error::PORT MISMATCH — probes dial :$PROBE_PORT but the app is only listening on: $LISTENING. Set PORT env in the manifest to match the app, or update containerPort/probe ports."
+            fi
+          else
+            echo "no pod found for label app.kubernetes.io/name=inventory-deploy-app-catalog"
+          fi
+          echo "::endgroup::"
+
+      - name: Rollback catalog on failed rollout
+        # Scoped to THIS service's own step outcomes (see sequentialDeploySteps
+        # comment). `always()` lets the step evaluate even when the job status
+        # is failure; the inner condition prevents rollback firing for a
+        # service whose steps were skipped because an earlier service failed.
+        # Contract §5: skip `rollout undo` on the first-ever deploy (history
+        # has only one revision — there's nothing to undo to; erroring on that
+        # confuses the log). We still print a clear message so the reader knows
+        # the pipeline recognised a first-deploy vs. an actual failure.
+        if: ${{ always() && (steps.apply_catalog.outcome == 'failure' || steps.restart_catalog.outcome == 'failure' || steps.wait_catalog.outcome == 'failure') }}
+        run: |
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-catalog -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          if [ "$REVS" -lt 2 ]; then
+            echo "::warning::Rollout of inventory-deploy-app-catalog failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
+            exit 1
+          fi
+          echo "::warning::Rollout of inventory-deploy-app-catalog failed its health check — rolling back to the previous revision."
+          kubectl rollout undo deployment/inventory-deploy-app-catalog -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-catalog -n storefront-dev --timeout=240s
+
+      - name: Apply checkout manifests
+        id: apply_checkout
+        # Prefer manifest.yaml — deploy_my_app writes exactly that file, and
+        # applying the whole dir picks up any stale *.yaml (e.g. a
+        # hand-committed service.yaml from an older scaffold) that
+        # alphabetically-sorts AFTER it and silently overrides the freshly
+        # generated resource (2026-08 incident). Fall back to the dir for
+        # repos whose manifests are still split across multiple files.
+        run: |
+          if [ -f "k8s/dev/checkout/manifest.yaml" ]; then
+            kubectl apply -n storefront-dev -f "k8s/dev/checkout/manifest.yaml"
+          else
+            kubectl apply -n storefront-dev -f "k8s/dev/checkout/"
+          fi
+
+      - name: Restart checkout rollout (image tag "latest" — force pods onto the new build)
+        id: restart_checkout
+        run: kubectl rollout restart deployment/inventory-deploy-app-checkout -n storefront-dev
+
+      - name: Wait for checkout rollout
+        id: wait_checkout
+        run: kubectl rollout status deployment/inventory-deploy-app-checkout -n storefront-dev --timeout=360s
+
+      - name: Diagnose checkout on failed rollout
+        # Runs BEFORE rollback so the job log preserves what actually went wrong
+        # — the rollback undoes the state that would answer "why did it fail?".
+        # Prints pods + describe + logs + events, and detects the port-mismatch
+        # class (contract §5) by reading /proc/net/tcp{,6} inside the container.
+        if: ${{ always() && (steps.apply_checkout.outcome == 'failure' || steps.restart_checkout.outcome == 'failure' || steps.wait_checkout.outcome == 'failure') }}
+        continue-on-error: true
+        run: |
+          echo "::group::pods"
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout -o wide || true
+          echo "::endgroup::"
+          echo "::group::describe"
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout | tail -n 60 || true
+          echo "::endgroup::"
+          echo "::group::logs"
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout --tail=100 --all-containers=true --prefix=true || true
+          echo "::endgroup::"
+          echo "::group::events"
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
+          echo "::endgroup::"
+          echo "::group::deployment facts (from facts.json, committed at discovery time)"
+          FACTS_FILE=$(ls -1 k8s/*/checkout/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
+          if [ -n "$FACTS_FILE" ] && [ -f "$FACTS_FILE" ]; then
+            echo "reading $FACTS_FILE"
+            if command -v jq >/dev/null 2>&1; then jq . "$FACTS_FILE" || cat "$FACTS_FILE"; else cat "$FACTS_FILE"; fi
+          else
+            echo "no facts.json found (this pipeline predates the discovery layer, or discovery failed for this service)"
+          fi
+          echo "::endgroup::"
+          echo "::group::port-mismatch check"
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-checkout -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
+              for f in /proc/net/tcp /proc/net/tcp6; do
+                [ -r "$f" ] || continue
+                awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
+              done | sort -u
+            ' 2>/dev/null | tr "\n" " " || true)
+            echo "probe expects port: $PROBE_PORT"
+            echo "app is listening on: ${LISTENING:-(nothing — process may have exited)}"
+            if [ -n "$PROBE_PORT" ] && [ -n "$LISTENING" ] && ! echo " $LISTENING " | grep -q " $PROBE_PORT "; then
+              echo "::error::PORT MISMATCH — probes dial :$PROBE_PORT but the app is only listening on: $LISTENING. Set PORT env in the manifest to match the app, or update containerPort/probe ports."
+            fi
+          else
+            echo "no pod found for label app.kubernetes.io/name=inventory-deploy-app-checkout"
+          fi
+          echo "::endgroup::"
+
+      - name: Rollback checkout on failed rollout
+        # Scoped to THIS service's own step outcomes (see sequentialDeploySteps
+        # comment). `always()` lets the step evaluate even when the job status
+        # is failure; the inner condition prevents rollback firing for a
+        # service whose steps were skipped because an earlier service failed.
+        # Contract §5: skip `rollout undo` on the first-ever deploy (history
+        # has only one revision — there's nothing to undo to; erroring on that
+        # confuses the log). We still print a clear message so the reader knows
+        # the pipeline recognised a first-deploy vs. an actual failure.
+        if: ${{ always() && (steps.apply_checkout.outcome == 'failure' || steps.restart_checkout.outcome == 'failure' || steps.wait_checkout.outcome == 'failure') }}
+        run: |
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-checkout -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          if [ "$REVS" -lt 2 ]; then
+            echo "::warning::Rollout of inventory-deploy-app-checkout failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
+            exit 1
+          fi
+          echo "::warning::Rollout of inventory-deploy-app-checkout failed its health check — rolling back to the previous revision."
+          kubectl rollout undo deployment/inventory-deploy-app-checkout -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-checkout -n storefront-dev --timeout=240s
+
+      - name: Apply orders manifests
+        id: apply_orders
+        # Prefer manifest.yaml — deploy_my_app writes exactly that file, and
+        # applying the whole dir picks up any stale *.yaml (e.g. a
+        # hand-committed service.yaml from an older scaffold) that
+        # alphabetically-sorts AFTER it and silently overrides the freshly
+        # generated resource (2026-08 incident). Fall back to the dir for
+        # repos whose manifests are still split across multiple files.
+        run: |
+          if [ -f "k8s/dev/orders/manifest.yaml" ]; then
+            kubectl apply -n storefront-dev -f "k8s/dev/orders/manifest.yaml"
+          else
+            kubectl apply -n storefront-dev -f "k8s/dev/orders/"
+          fi
+
+      - name: Restart orders rollout (image tag "latest" — force pods onto the new build)
+        id: restart_orders
+        run: kubectl rollout restart deployment/inventory-deploy-app-orders -n storefront-dev
+
+      - name: Wait for orders rollout
+        id: wait_orders
+        run: kubectl rollout status deployment/inventory-deploy-app-orders -n storefront-dev --timeout=360s
+
+      - name: Diagnose orders on failed rollout
+        # Runs BEFORE rollback so the job log preserves what actually went wrong
+        # — the rollback undoes the state that would answer "why did it fail?".
+        # Prints pods + describe + logs + events, and detects the port-mismatch
+        # class (contract §5) by reading /proc/net/tcp{,6} inside the container.
+        if: ${{ always() && (steps.apply_orders.outcome == 'failure' || steps.restart_orders.outcome == 'failure' || steps.wait_orders.outcome == 'failure') }}
+        continue-on-error: true
+        run: |
+          echo "::group::pods"
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders -o wide || true
+          echo "::endgroup::"
+          echo "::group::describe"
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders | tail -n 60 || true
+          echo "::endgroup::"
+          echo "::group::logs"
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders --tail=100 --all-containers=true --prefix=true || true
+          echo "::endgroup::"
+          echo "::group::events"
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
+          echo "::endgroup::"
+          echo "::group::deployment facts (from facts.json, committed at discovery time)"
+          FACTS_FILE=$(ls -1 k8s/*/orders/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
+          if [ -n "$FACTS_FILE" ] && [ -f "$FACTS_FILE" ]; then
+            echo "reading $FACTS_FILE"
+            if command -v jq >/dev/null 2>&1; then jq . "$FACTS_FILE" || cat "$FACTS_FILE"; else cat "$FACTS_FILE"; fi
+          else
+            echo "no facts.json found (this pipeline predates the discovery layer, or discovery failed for this service)"
+          fi
+          echo "::endgroup::"
+          echo "::group::port-mismatch check"
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-orders -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
+              for f in /proc/net/tcp /proc/net/tcp6; do
+                [ -r "$f" ] || continue
+                awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
+              done | sort -u
+            ' 2>/dev/null | tr "\n" " " || true)
+            echo "probe expects port: $PROBE_PORT"
+            echo "app is listening on: ${LISTENING:-(nothing — process may have exited)}"
+            if [ -n "$PROBE_PORT" ] && [ -n "$LISTENING" ] && ! echo " $LISTENING " | grep -q " $PROBE_PORT "; then
+              echo "::error::PORT MISMATCH — probes dial :$PROBE_PORT but the app is only listening on: $LISTENING. Set PORT env in the manifest to match the app, or update containerPort/probe ports."
+            fi
+          else
+            echo "no pod found for label app.kubernetes.io/name=inventory-deploy-app-orders"
+          fi
+          echo "::endgroup::"
+
+      - name: Rollback orders on failed rollout
+        # Scoped to THIS service's own step outcomes (see sequentialDeploySteps
+        # comment). `always()` lets the step evaluate even when the job status
+        # is failure; the inner condition prevents rollback firing for a
+        # service whose steps were skipped because an earlier service failed.
+        # Contract §5: skip `rollout undo` on the first-ever deploy (history
+        # has only one revision — there's nothing to undo to; erroring on that
+        # confuses the log). We still print a clear message so the reader knows
+        # the pipeline recognised a first-deploy vs. an actual failure.
+        if: ${{ always() && (steps.apply_orders.outcome == 'failure' || steps.restart_orders.outcome == 'failure' || steps.wait_orders.outcome == 'failure') }}
+        run: |
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-orders -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          if [ "$REVS" -lt 2 ]; then
+            echo "::warning::Rollout of inventory-deploy-app-orders failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
+            exit 1
+          fi
+          echo "::warning::Rollout of inventory-deploy-app-orders failed its health check — rolling back to the previous revision."
+          kubectl rollout undo deployment/inventory-deploy-app-orders -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-orders -n storefront-dev --timeout=240s
+
+      - name: Apply ui manifests
+        id: apply_ui
+        # Prefer manifest.yaml — deploy_my_app writes exactly that file, and
+        # applying the whole dir picks up any stale *.yaml (e.g. a
+        # hand-committed service.yaml from an older scaffold) that
+        # alphabetically-sorts AFTER it and silently overrides the freshly
+        # generated resource (2026-08 incident). Fall back to the dir for
+        # repos whose manifests are still split across multiple files.
+        run: |
+          if [ -f "k8s/dev/ui/manifest.yaml" ]; then
+            kubectl apply -n storefront-dev -f "k8s/dev/ui/manifest.yaml"
+          else
+            kubectl apply -n storefront-dev -f "k8s/dev/ui/"
+          fi
+
+      - name: Restart ui rollout (image tag "latest" — force pods onto the new build)
+        id: restart_ui
+        run: kubectl rollout restart deployment/inventory-deploy-app-ui -n storefront-dev
+
+      - name: Wait for ui rollout
+        id: wait_ui
+        run: kubectl rollout status deployment/inventory-deploy-app-ui -n storefront-dev --timeout=360s
+
+      - name: Diagnose ui on failed rollout
+        # Runs BEFORE rollback so the job log preserves what actually went wrong
+        # — the rollback undoes the state that would answer "why did it fail?".
+        # Prints pods + describe + logs + events, and detects the port-mismatch
+        # class (contract §5) by reading /proc/net/tcp{,6} inside the container.
+        if: ${{ always() && (steps.apply_ui.outcome == 'failure' || steps.restart_ui.outcome == 'failure' || steps.wait_ui.outcome == 'failure') }}
+        continue-on-error: true
+        run: |
+          echo "::group::pods"
+          kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui -o wide || true
+          echo "::endgroup::"
+          echo "::group::describe"
+          kubectl describe pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui | tail -n 60 || true
+          echo "::endgroup::"
+          echo "::group::logs"
+          kubectl logs -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui --tail=100 --all-containers=true --prefix=true || true
+          echo "::endgroup::"
+          echo "::group::events"
+          kubectl get events -n storefront-dev --sort-by=.lastTimestamp | tail -n 30 || true
+          echo "::endgroup::"
+          echo "::group::deployment facts (from facts.json, committed at discovery time)"
+          FACTS_FILE=$(ls -1 k8s/*/ui/facts.json k8s/*/facts.json 2>/dev/null | head -n 1 || true)
+          if [ -n "$FACTS_FILE" ] && [ -f "$FACTS_FILE" ]; then
+            echo "reading $FACTS_FILE"
+            if command -v jq >/dev/null 2>&1; then jq . "$FACTS_FILE" || cat "$FACTS_FILE"; else cat "$FACTS_FILE"; fi
+          else
+            echo "no facts.json found (this pipeline predates the discovery layer, or discovery failed for this service)"
+          fi
+          echo "::endgroup::"
+          echo "::group::port-mismatch check"
+          POD=$(kubectl get pods -n storefront-dev -l app.kubernetes.io/name=inventory-deploy-app-ui -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            PROBE_PORT=$(kubectl get pod -n storefront-dev "$POD" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+            LISTENING=$(kubectl exec -n storefront-dev "$POD" -- sh -c '
+              for f in /proc/net/tcp /proc/net/tcp6; do
+                [ -r "$f" ] || continue
+                awk "NR>1 && \$4==\"0A\" { split(\$2,a,\":\"); print strtonum(\"0x\" a[2]) }" "$f"
+              done | sort -u
+            ' 2>/dev/null | tr "\n" " " || true)
+            echo "probe expects port: $PROBE_PORT"
+            echo "app is listening on: ${LISTENING:-(nothing — process may have exited)}"
+            if [ -n "$PROBE_PORT" ] && [ -n "$LISTENING" ] && ! echo " $LISTENING " | grep -q " $PROBE_PORT "; then
+              echo "::error::PORT MISMATCH — probes dial :$PROBE_PORT but the app is only listening on: $LISTENING. Set PORT env in the manifest to match the app, or update containerPort/probe ports."
+            fi
+          else
+            echo "no pod found for label app.kubernetes.io/name=inventory-deploy-app-ui"
+          fi
+          echo "::endgroup::"
+
+      - name: Rollback ui on failed rollout
+        # Scoped to THIS service's own step outcomes (see sequentialDeploySteps
+        # comment). `always()` lets the step evaluate even when the job status
+        # is failure; the inner condition prevents rollback firing for a
+        # service whose steps were skipped because an earlier service failed.
+        # Contract §5: skip `rollout undo` on the first-ever deploy (history
+        # has only one revision — there's nothing to undo to; erroring on that
+        # confuses the log). We still print a clear message so the reader knows
+        # the pipeline recognised a first-deploy vs. an actual failure.
+        if: ${{ always() && (steps.apply_ui.outcome == 'failure' || steps.restart_ui.outcome == 'failure' || steps.wait_ui.outcome == 'failure') }}
+        run: |
+          REVS=$(kubectl rollout history deployment/inventory-deploy-app-ui -n storefront-dev 2>/dev/null | tail -n +3 | grep -c '^' || echo 0)
+          if [ "$REVS" -lt 2 ]; then
+            echo "::warning::Rollout of inventory-deploy-app-ui failed and this is the first-ever deploy (rollout history has $REVS revision). Nothing to roll back to — leaving the failed pods in place so you can debug them."
+            exit 1
+          fi
+          echo "::warning::Rollout of inventory-deploy-app-ui failed its health check — rolling back to the previous revision."
+          kubectl rollout undo deployment/inventory-deploy-app-ui -n storefront-dev
+          kubectl rollout status deployment/inventory-deploy-app-ui -n storefront-dev --timeout=240s
